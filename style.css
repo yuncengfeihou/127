@@ -39,3 +39,9 @@
 .mt-2 {
     margin-top: 10px;
 }
+
+.prompt-exporter-settings .fa-circle-info {
+    margin-left: 5px;
+    color: #888;
+    cursor: help;
+}

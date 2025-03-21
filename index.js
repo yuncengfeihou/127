@@ -1,6 +1,7 @@
 import { extension_settings, loadExtensionSettings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { eventSource, event_types } from "../../../../script.js";
+import { margeStructPromptChatLog, structPromptToSingle } from "../../../../decl/prompt_struct.mjs";
 
 // 插件名称，与文件夹名一致
 const extensionName = "prompt-exporter";
@@ -14,9 +15,9 @@ let exportCount = 0;
 const defaultSettings = {
     enabled: true,
     autoExport: false,
-    debugMode: false,
+    debugMode: true,  // 默认开启调试模式方便排查
     prettyPrint: true,  // 格式化JSON输出
-    includeRawData: true // 包含原始数据
+    interceptMode: true // 使用拦截模式捕获数据
 };
 
 // 日志函数
@@ -38,41 +39,35 @@ function logError(...args) {
     console.error(logPrefix, ...args);
 }
 
-// 安全地检查对象结构并输出详细信息
-function safelyInspectObject(obj, path = '') {
+// 安全地检查对象结构
+function inspectObject(obj, path = '', maxDepth = 2, currentDepth = 0) {
     try {
-        if (!obj) {
-            logDebug(`${path || 'Object'} 为空或未定义`);
-            return;
+        if (currentDepth > maxDepth) return `[达到最大深度${maxDepth}]`;
+        
+        if (obj === null) return 'null';
+        if (obj === undefined) return 'undefined';
+        if (typeof obj !== 'object') return `${typeof obj}: ${String(obj).substring(0, 50)}`;
+        
+        if (Array.isArray(obj)) {
+            const info = `数组[${obj.length}]`;
+            if (currentDepth === maxDepth) return info;
+            
+            const items = obj.slice(0, 3).map(item => 
+                inspectObject(item, '', maxDepth, currentDepth + 1)
+            );
+            return `${info}${items.length ? ': [' + items.join(', ') + (obj.length > 3 ? ', ...' : '') + ']' : ''}`;
         }
         
-        if (typeof obj !== 'object') {
-            logDebug(`${path || 'Object'} 不是对象，而是 ${typeof obj}`);
-            return;
-        }
-        
-        // 检查主要属性
         const keys = Object.keys(obj);
-        logDebug(`${path || 'Object'} 包含 ${keys.length} 个属性: ${keys.join(', ')}`);
+        const info = `对象{${keys.length}键}`;
+        if (currentDepth === maxDepth) return info;
         
-        // 特别关注single_part_prompt_t结构
-        if (obj.text) {
-            logDebug(`${path}.text 是数组: ${Array.isArray(obj.text)}, 长度: ${Array.isArray(obj.text) ? obj.text.length : 'N/A'}`);
-            if (Array.isArray(obj.text) && obj.text.length > 0) {
-                const sample = obj.text[0];
-                logDebug(`${path}.text[0] 示例: ${JSON.stringify(sample)}`);
-            }
-        }
-        
-        if (obj.additional_chat_log) {
-            logDebug(`${path}.additional_chat_log 是数组: ${Array.isArray(obj.additional_chat_log)}, 长度: ${Array.isArray(obj.additional_chat_log) ? obj.additional_chat_log.length : 'N/A'}`);
-        }
-        
-        if (obj.extension) {
-            logDebug(`${path}.extension 是对象: ${typeof obj.extension === 'object'}, 键数: ${typeof obj.extension === 'object' ? Object.keys(obj.extension).length : 'N/A'}`);
-        }
+        const entries = keys.slice(0, 5).map(key => 
+            `${key}: ${inspectObject(obj[key], '', maxDepth, currentDepth + 1)}`
+        );
+        return `${info}${entries.length ? ': {' + entries.join(', ') + (keys.length > 5 ? ', ...' : '') + '}' : ''}`;
     } catch (error) {
-        logError(`检查对象结构时出错: ${error.message}`);
+        return `[检查时出错: ${error.message}]`;
     }
 }
 
@@ -89,7 +84,7 @@ function loadSettings() {
     $('#prompt_exporter_auto').prop('checked', extension_settings[extensionName].autoExport);
     $('#prompt_exporter_debug').prop('checked', extension_settings[extensionName].debugMode);
     $('#prompt_exporter_pretty').prop('checked', extension_settings[extensionName].prettyPrint);
-    $('#prompt_exporter_raw').prop('checked', extension_settings[extensionName].includeRawData);
+    $('#prompt_exporter_intercept').prop('checked', extension_settings[extensionName].interceptMode);
     
     logDebug('设置加载完成', extension_settings[extensionName]);
 }
@@ -146,125 +141,136 @@ function exportPromptStruct() {
     }
 }
 
-// 深拷贝函数，避免循环引用问题
-function safeDeepCopy(obj) {
+// 建立拦截器
+function setupPromptInterceptor() {
+    if (!extension_settings[extensionName].interceptMode) {
+        logDebug('拦截器模式已禁用');
+        return;
+    }
+    
+    logInfo('正在设置buildPromptStruct拦截器');
+    
     try {
-        // 使用更安全的方法处理循环引用和特殊对象
-        const seen = new WeakMap();
-        
-        const replacer = (key, value) => {
-            // 处理特殊对象类型
-            if (value instanceof Map) {
-                return { 
-                    __type: 'Map', 
-                    data: Array.from(value.entries()) 
-                };
-            }
-            if (value instanceof Set) {
-                return { 
-                    __type: 'Set', 
-                    data: Array.from(value) 
-                };
-            }
-            if (value instanceof RegExp) {
-                return { 
-                    __type: 'RegExp', 
-                    source: value.source, 
-                    flags: value.flags 
-                };
-            }
-            if (value instanceof Date) {
-                return { 
-                    __type: 'Date', 
-                    iso: value.toISOString() 
-                };
-            }
-            if (typeof value === 'function') {
-                return { 
-                    __type: 'Function', 
-                    name: value.name || 'anonymous' 
-                };
-            }
-            if (value instanceof Error) {
-                return { 
-                    __type: 'Error', 
-                    message: value.message, 
-                    stack: value.stack 
-                };
+        // 导入buildPromptStruct函数
+        import("../../../../decl/prompt_struct.mjs").then(module => {
+            if (!module.buildPromptStruct) {
+                logError('找不到buildPromptStruct函数');
+                return;
             }
             
-            // 处理对象和数组的循环引用
-            if (typeof value === 'object' && value !== null) {
-                if (seen.has(value)) {
-                    return { __type: 'Circular', id: '[循环引用]' };
+            // 保存原始函数
+            const originalBuildPrompt = module.buildPromptStruct;
+            
+            // 替换为我们的拦截版本
+            module.buildPromptStruct = async function(...args) {
+                try {
+                    // 调用原始函数
+                    const result = await originalBuildPrompt.apply(this, args);
+                    
+                    // 如果插件被禁用，直接返回结果
+                    if (!extension_settings[extensionName].enabled) {
+                        return result;
+                    }
+                    
+                    logDebug('拦截到buildPromptStruct调用，参数:', inspectObject(args[0]));
+                    logDebug('返回完整prompt_struct:', inspectObject(result));
+                    
+                    // 将结果保存为最新的promptStruct
+                    lastPromptStruct = JSON.parse(JSON.stringify(result));
+                    
+                    logInfo('通过拦截器成功捕获完整prompt结构');
+                    
+                    // 生成调试信息
+                    if (extension_settings[extensionName].debugMode) {
+                        if (result.user_prompt && result.user_prompt.text) {
+                            logDebug(`user_prompt.text包含${result.user_prompt.text.length}条项目`);
+                            for (let i = 0; i < Math.min(3, result.user_prompt.text.length); i++) {
+                                const item = result.user_prompt.text[i];
+                                logDebug(`user_prompt.text[${i}]:`, item ? inspectObject(item) : 'undefined');
+                            }
+                        }
+                        
+                        if (result.char_prompt && result.char_prompt.text) {
+                            logDebug(`char_prompt.text包含${result.char_prompt.text.length}条项目`);
+                            for (let i = 0; i < Math.min(3, result.char_prompt.text.length); i++) {
+                                const item = result.char_prompt.text[i];
+                                logDebug(`char_prompt.text[${i}]:`, item ? inspectObject(item) : 'undefined');
+                            }
+                        }
+                    }
+                    
+                    // 如果启用了自动导出，则自动下载文件
+                    if (extension_settings[extensionName].autoExport) {
+                        logDebug('自动导出模式已启用，自动导出Prompt结构');
+                        exportPromptStruct();
+                    }
+                    
+                    return result;
+                } catch (error) {
+                    logError('拦截buildPromptStruct时出错:', error);
+                    // 返回原始函数结果，确保正常功能不受影响
+                    return originalBuildPrompt.apply(this, args);
                 }
-                seen.set(value, true);
+            };
+            
+            logInfo('buildPromptStruct拦截器设置成功');
+        }).catch(error => {
+            logError('导入buildPromptStruct函数时出错:', error);
+        });
+        
+        // 尝试拦截structPromptToSingle函数获取完整数据
+        import("../../../../decl/prompt_struct.mjs").then(module => {
+            if (!module.structPromptToSingle) {
+                logError('找不到structPromptToSingle函数');
+                return;
             }
             
-            return value;
-        };
+            // 保存原始函数
+            const originalStructPromptToSingle = module.structPromptToSingle;
+            
+            // 替换为我们的拦截版本
+            module.structPromptToSingle = function(prompt) {
+                try {
+                    // 如果插件被禁用，直接返回结果
+                    if (!extension_settings[extensionName].enabled) {
+                        return originalStructPromptToSingle.apply(this, [prompt]);
+                    }
+                    
+                    logDebug('拦截到structPromptToSingle调用');
+                    
+                    // 深拷贝捕获的数据
+                    if (prompt && typeof prompt === 'object') {
+                        lastPromptStruct = JSON.parse(JSON.stringify(prompt));
+                        logInfo('通过structPromptToSingle拦截器成功捕获完整prompt结构');
+                        
+                        // 如果启用了自动导出，则自动下载文件
+                        if (extension_settings[extensionName].autoExport) {
+                            logDebug('自动导出模式已启用，自动导出Prompt结构');
+                            exportPromptStruct();
+                        }
+                    }
+                    
+                    // 调用原始函数
+                    return originalStructPromptToSingle.apply(this, [prompt]);
+                } catch (error) {
+                    logError('拦截structPromptToSingle时出错:', error);
+                    // 返回原始函数结果，确保正常功能不受影响
+                    return originalStructPromptToSingle.apply(this, [prompt]);
+                }
+            };
+            
+            logInfo('structPromptToSingle拦截器设置成功');
+        }).catch(error => {
+            logError('导入structPromptToSingle函数时出错:', error);
+        });
         
-        return JSON.parse(JSON.stringify(obj, replacer));
     } catch (error) {
-        logError('深拷贝过程中出错:', error);
-        // 尝试使用更简单的方法
-        try {
-            // 排除可能导致循环引用的字段
-            const sanitized = { ...obj };
-            return sanitized;
-        } catch (fallbackError) {
-            logError('备用深拷贝也失败:', fallbackError);
-            return { error: '无法安全复制对象', message: error.message };
-        }
+        logError('设置拦截器时出错:', error);
     }
 }
 
-// 验证prompt_struct结构是否完整
-function validatePromptStruct(prompt_struct) {
-    if (!prompt_struct) return false;
-    
-    const requiredProps = ['char_prompt', 'user_prompt', 'world_prompt', 'chat_log'];
-    const missingProps = requiredProps.filter(prop => !prompt_struct.hasOwnProperty(prop));
-    
-    if (missingProps.length > 0) {
-        logWarning(`Prompt结构缺少必要属性: ${missingProps.join(', ')}`);
-        return false;
-    }
-    
-    // 检查single_part_prompt_t结构
-    const singlePartPrompts = [
-        { name: 'char_prompt', obj: prompt_struct.char_prompt },
-        { name: 'user_prompt', obj: prompt_struct.user_prompt },
-        { name: 'world_prompt', obj: prompt_struct.world_prompt }
-    ];
-    
-    for (const { name, obj } of singlePartPrompts) {
-        if (!obj || typeof obj !== 'object') {
-            logWarning(`${name} 不是有效对象`);
-            return false;
-        }
-        
-        if (!Array.isArray(obj.text)) {
-            logWarning(`${name}.text 不是数组`);
-            return false;
-        }
-        
-        if (!Array.isArray(obj.additional_chat_log)) {
-            logWarning(`${name}.additional_chat_log 不是数组`);
-            return false;
-        }
-        
-        if (typeof obj.extension !== 'object') {
-            logWarning(`${name}.extension 不是对象`);
-            return false;
-        }
-    }
-    
-    return true;
-}
-
-// 监听事件：CHAT_COMPLETION_PROMPT_READY
-function handlePromptReady(promptStruct) {
+// 处理事件
+function handlePromptReady(prompt_struct) {
     try {
         if (!extension_settings[extensionName].enabled) {
             logDebug('插件已禁用，不处理prompt');
@@ -272,92 +278,22 @@ function handlePromptReady(promptStruct) {
         }
         
         logInfo('捕获到Prompt结构');
+        logDebug('PromptStruct基本属性:', Object.keys(prompt_struct));
         
-        // 检查prompt_struct结构
-        if (!promptStruct) {
-            logWarning('收到的promptStruct为null或undefined');
+        // 检查是否为预期的prompt_struct格式
+        if (!prompt_struct.char_prompt || !prompt_struct.user_prompt || !prompt_struct.world_prompt) {
+            logWarning('Prompt结构缺少必要属性: char_prompt, user_prompt, world_prompt, chat_log');
+            
+            // 尝试查看prompt_struct详细信息以便调试
+            for (const key in prompt_struct) {
+                logDebug(`prompt_struct.${key} =`, inspectObject(prompt_struct[key]));
+            }
+            
             return;
         }
         
-        // 记录原始数据结构以用于调试
-        if (extension_settings[extensionName].debugMode) {
-            logDebug('PromptStruct基本属性:', Object.keys(promptStruct));
-            
-            // 检查主要组件
-            safelyInspectObject(promptStruct.char_prompt, 'char_prompt');
-            safelyInspectObject(promptStruct.user_prompt, 'user_prompt');
-            safelyInspectObject(promptStruct.world_prompt, 'world_prompt');
-            
-            // 检查plugin_prompts
-            if (promptStruct.plugin_prompts) {
-                const pluginKeys = Object.keys(promptStruct.plugin_prompts);
-                logDebug(`plugin_prompts包含${pluginKeys.length}个插件: ${pluginKeys.join(', ')}`);
-                
-                for (const key of pluginKeys) {
-                    safelyInspectObject(promptStruct.plugin_prompts[key], `plugin_prompts.${key}`);
-                }
-            }
-            
-            // 检查other_chars_prompt
-            if (promptStruct.other_chars_prompt) {
-                const charKeys = Object.keys(promptStruct.other_chars_prompt);
-                logDebug(`other_chars_prompt包含${charKeys.length}个角色: ${charKeys.join(', ')}`);
-                
-                for (const key of charKeys) {
-                    safelyInspectObject(promptStruct.other_chars_prompt[key], `other_chars_prompt.${key}`);
-                }
-            }
-        }
-        
-        // 深拷贝结构以防止修改原始数据
-        const promptStructCopy = safeDeepCopy(promptStruct);
-        
-        // 验证结构完整性
-        if (!validatePromptStruct(promptStructCopy)) {
-            logWarning('Prompt结构验证失败，尝试修复...');
-            
-            // 尝试修复缺失的结构
-            if (!promptStructCopy.char_prompt || typeof promptStructCopy.char_prompt !== 'object') {
-                promptStructCopy.char_prompt = { text: [], additional_chat_log: [], extension: {} };
-            }
-            
-            if (!promptStructCopy.user_prompt || typeof promptStructCopy.user_prompt !== 'object') {
-                promptStructCopy.user_prompt = { text: [], additional_chat_log: [], extension: {} };
-            }
-            
-            if (!promptStructCopy.world_prompt || typeof promptStructCopy.world_prompt !== 'object') {
-                promptStructCopy.world_prompt = { text: [], additional_chat_log: [], extension: {} };
-            }
-            
-            // 确保text, additional_chat_log和extension存在
-            ['char_prompt', 'user_prompt', 'world_prompt'].forEach(prop => {
-                if (!Array.isArray(promptStructCopy[prop].text)) {
-                    promptStructCopy[prop].text = [];
-                }
-                
-                if (!Array.isArray(promptStructCopy[prop].additional_chat_log)) {
-                    promptStructCopy[prop].additional_chat_log = [];
-                }
-                
-                if (typeof promptStructCopy[prop].extension !== 'object') {
-                    promptStructCopy[prop].extension = {};
-                }
-            });
-        }
-        
-        // 如果用户需要原始数据
-        if (extension_settings[extensionName].includeRawData) {
-            // 提取聊天内容转换成适合查看的格式
-            const chatContent = (promptStructCopy.chat_log || []).map(entry => ({
-                role: entry.role,
-                content: entry.content
-            }));
-            
-            promptStructCopy._raw_chat = chatContent;
-        }
-        
-        // 保存处理后的prompt结构
-        lastPromptStruct = promptStructCopy;
+        // 深拷贝以防止修改原始数据
+        lastPromptStruct = JSON.parse(JSON.stringify(prompt_struct));
         
         logInfo('已保存最新的Prompt结构数据');
         
@@ -368,7 +304,6 @@ function handlePromptReady(promptStruct) {
         }
     } catch (error) {
         logError('处理Prompt结构失败', error);
-        toastr.error(`处理Prompt失败: ${error.message}`, '错误');
     }
 }
 
@@ -411,10 +346,11 @@ jQuery(async () => {
                         </label>
                     </div>
                     <div class="flex-container">
-                        <label class="checkbox_label" for="prompt_exporter_raw">
-                            <input id="prompt_exporter_raw" type="checkbox" />
-                            <span>包含原始聊天数据</span>
+                        <label class="checkbox_label" for="prompt_exporter_intercept">
+                            <input id="prompt_exporter_intercept" type="checkbox" />
+                            <span>使用拦截模式 (推荐)</span>
                         </label>
+                        <div class="fa-solid fa-circle-info" title="拦截模式可以更准确地捕获完整prompt结构。禁用后需要重启SillyTavern。"></div>
                     </div>
                     <div class="flex-container mt-2">
                         <input id="prompt_exporter_button" class="menu_button" type="button" value="导出最新Prompt结构" />
@@ -455,9 +391,16 @@ jQuery(async () => {
             saveSettingsDebounced();
         });
         
-        $('#prompt_exporter_raw').on('change', function() {
-            extension_settings[extensionName].includeRawData = !!$(this).prop('checked');
-            logInfo(`包含原始数据已${extension_settings[extensionName].includeRawData ? '启用' : '禁用'}`);
+        $('#prompt_exporter_intercept').on('change', function() {
+            extension_settings[extensionName].interceptMode = !!$(this).prop('checked');
+            logInfo(`拦截模式已${extension_settings[extensionName].interceptMode ? '启用' : '禁用'}`);
+            
+            if (extension_settings[extensionName].interceptMode) {
+                setupPromptInterceptor();
+            } else {
+                toastr.warning('更改拦截模式设置需要重启SillyTavern才能生效', '需要重启');
+            }
+            
             saveSettingsDebounced();
         });
         
@@ -469,6 +412,9 @@ jQuery(async () => {
         // 监听SillyTavern事件
         logDebug('注册事件监听器');
         eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, handlePromptReady);
+        
+        // 设置拦截器(这是获取完整结构的最可靠方法)
+        setupPromptInterceptor();
         
         // 加载设置
         loadSettings();

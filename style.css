@@ -1,0 +1,41 @@
+.prompt-exporter-settings .flex-container {
+    display: flex;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.prompt-exporter-settings .menu_button {
+    background-color: #2d73b9;
+    color: white;
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+    margin-right: 10px;
+}
+
+.prompt-exporter-settings .menu_button:hover {
+    background-color: #1e5b93;
+}
+
+#prompt_exporter_status {
+    font-style: italic;
+    color: #888;
+    margin-top: 5px;
+}
+
+.prompt-exporter-settings .checkbox_label {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    margin-right: 15px;
+}
+
+.prompt-exporter-settings .checkbox_label span {
+    margin-left: 5px;
+}
+
+.mt-2 {
+    margin-top: 10px;
+}

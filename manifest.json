@@ -1,0 +1,11 @@
+{
+    "display_name": "Prompt结构导出器127",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "AI助手",
+    "version": "1.0.1",
+    "homePage": ""
+}

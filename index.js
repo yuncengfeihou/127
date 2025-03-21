@@ -1,7 +1,7 @@
 import { extension_settings, loadExtensionSettings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { eventSource, event_types } from "../../../../script.js";
-import { margeStructPromptChatLog, structPromptToSingle } from "../../../../decl/prompt_struct.mjs";
+import { margeStructPromptChatLog, structPromptToSingle } from "../../../../scripts/extensions/third-party/fount/src/public/shells/chat/src/server/prompt_struct.mjs";
 
 // 插件名称，与文件夹名一致
 const extensionName = "prompt-exporter";
